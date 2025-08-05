@@ -4,7 +4,7 @@
 // dr -d foo.txt  delete forever
 
 use std::{
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,7 +33,6 @@ struct Cli {
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    // default
     Drop,
     Delete,
     Recover,
@@ -51,7 +50,6 @@ impl Parse for Cli {
     type Item = Cli;
 
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self::Item, String> {
-        // defaults
         let mut command = Command::Drop;
         let mut filepaths = Vec::new();
 
@@ -60,12 +58,24 @@ impl Parse for Cli {
                 "--list" | "-l" => command = Command::List,
                 "--recover" | "-r" => {
                     command = Command::Recover;
-                    filepaths.extend(args.map(|a| Path::new(&a).to_path_buf()));
+                    filepaths.extend(args.map(|a| Path::new(&a).to_path_buf()).map(|p| {
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            env::current_dir().unwrap().join(p)
+                        }
+                    }));
                 }
 
                 "--delete" | "-d" => {
                     command = Command::Delete;
-                    filepaths.extend(args.map(|a| Path::new(&a).to_path_buf()));
+                    filepaths.extend(args.map(|a| Path::new(&a).to_path_buf()).map(|p| {
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            env::current_dir().unwrap().join(p)
+                        }
+                    }));
                 }
 
                 "--help" | "-h" => command = Command::Help,
@@ -73,13 +83,27 @@ impl Parse for Cli {
                 other => {
                     command = Command::Drop;
 
-                    filepaths.push(Path::new(&other).to_path_buf());
-                    filepaths.extend(args.map(|a| Path::new(&a).to_path_buf()));
+                    let path = Path::new(other);
+                    filepaths.push(if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        env::current_dir().unwrap().join(path)
+                    });
+
+                    filepaths.extend(args.map(|a| Path::new(&a).to_path_buf()).map(|p| {
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            env::current_dir().unwrap().join(p)
+                        }
+                    }));
                 }
             }
         }
 
-        if command != Command::List && filepaths.is_empty() {
+        if matches!(command, Command::Drop | Command::Delete | Command::Recover)
+            && filepaths.is_empty()
+        {
             return Err("Missing filepaths".to_string());
         }
 
@@ -103,21 +127,22 @@ fn main() {
         }
     };
 
-    if !Path::new(ROOT_DIR).exists() {
+    let root = Path::new(ROOT_DIR);
+    if !root.exists() {
         fs::create_dir(ROOT_DIR).expect("Failed to create dr default dir");
     }
 
     match args.command {
-        Command::Drop => drop_entries(&args.filepaths.unwrap()),
-        Command::Delete => delete_entries(&args.filepaths.unwrap()),
-        Command::Recover => recover_entires(&args.filepaths.unwrap()),
-        Command::List => list_entries(),
+        Command::Drop => drop_entries(&args.filepaths.unwrap(), root),
+        Command::Delete => delete_entries(&args.filepaths.unwrap(), root),
+        Command::Recover => recover_entries(&args.filepaths.unwrap(), root),
+        Command::List => list_entries(root),
         Command::Help => println!("{USAGE}"),
     }
 }
 
-fn list_entries() {
-    let entries = match fs::read_dir(ROOT_DIR) {
+fn list_entries(root: &Path) {
+    let entries = match fs::read_dir(root) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
@@ -133,111 +158,172 @@ fn list_entries() {
                 continue;
             }
         };
-        let e = e.path();
-        println!("{e}", e = e.display());
+
+        let path = e.path();
+        let filename = path.file_name().unwrap().to_string_lossy();
+
+        if let Some((_, original_name)) = filename.split_once('_') {
+            println!("{original_name}");
+        } else {
+            println!("{filename}");
+        }
     }
 }
 
-fn recover_entires(filepaths: &[PathBuf]) {
-    let dropped_files = match fs::read_dir(ROOT_DIR) {
+fn recover_entries(filepaths: &[PathBuf], root: &Path) {
+    let dropped_files = match fs::read_dir(root) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
             return;
         }
     };
+
     let dropped_paths: Vec<(PathBuf, PathBuf)> = dropped_files
         .flatten()
-        .map(|p| p.path().to_string_lossy().to_string())
-        .filter_map(|s| {
-            let old_name = Path::new(s.as_str().split_once("_").unwrap().1).to_path_buf();
-            if filepaths.contains(&old_name) {
-                let s = Path::new(&s).to_path_buf();
-                Some((s, old_name))
+        .filter_map(|entry| {
+            let stored_path = entry.path();
+            let filename = stored_path.file_name()?.to_string_lossy();
+
+            let (_, original_name) = filename.split_once('_')?;
+            let original_path = PathBuf::from(original_name);
+
+            if filepaths.contains(&original_path) {
+                Some((stored_path, original_path))
             } else {
                 None
             }
         })
         .collect();
 
-    for (current, old_name) in dropped_paths {
-        if !old_name.exists() {
-            eprintln!(
-                "File: {old_name} already exists!",
-                old_name = old_name.display()
-            );
+    for (stored_path, original_path) in dropped_paths {
+        if original_path.exists() {
+            eprintln!("File already exists: {}", original_path.display());
             continue;
         }
 
-        if let Err(e) = fs::copy(current, &old_name) {
-            eprintln!("{e}");
+        if let Some(parent) = original_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("Failed to create directories: {e}");
+                continue;
+            }
         }
-        println!("Recovered: {old_name}", old_name = &old_name.display());
+
+        if let Err(e) = fs::rename(&stored_path, &original_path) {
+            eprintln!("Failed to recover {}: {e}", original_path.display());
+        } else {
+            println!("Recovered: {}", original_path.display());
+        }
     }
 }
 
-fn delete_entries(filepaths: &[PathBuf]) {
-    // Dropped entries are saved as `{date}_{old_filename}` in the root_dir
-    let dropped_files = match fs::read_dir(ROOT_DIR) {
+fn delete_entries(filepaths: &[PathBuf], root: &Path) {
+    let dropped_files = match fs::read_dir(root) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("Error reading dropped files: {e}");
             return;
         }
     };
+
     let dropped_paths: Vec<PathBuf> = dropped_files
         .flatten()
-        .map(|p| p.path().to_string_lossy().to_string())
-        .filter_map(|s| {
-            // This unwrap could be triggered if something tempered with the
-            // naming convection in the root_dir
-            let old_name = Path::new(s.as_str().split_once("_").unwrap().1).to_path_buf();
-            if filepaths.contains(&old_name) {
-                let current = Path::new(&s).to_path_buf();
-                Some(current)
+        .filter_map(|entry| {
+            let stored_path = entry.path();
+            let filename = stored_path.file_name()?.to_string_lossy();
+
+            let (_, original_name) = filename.split_once('_')?;
+            let original_path = PathBuf::from(original_name);
+
+            if filepaths.contains(&original_path) {
+                Some(stored_path)
             } else {
                 None
             }
         })
         .collect();
 
-    for p in dropped_paths {
-        if p.is_dir() {
-            if let Err(e) = fs::remove_dir_all(p) {
-                eprintln!("{e}");
-            }
-        } else if let Err(e) = fs::remove_file(p) {
-            eprintln!("{e}");
+    for path in dropped_paths {
+        let result = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+
+        if let Err(e) = result {
+            eprintln!("Failed to delete {}: {e}", path.display());
+        } else {
+            println!("Permanently deleted: {}", path.display());
         }
     }
 }
 
-// Dropped entries are saved as `{date}_{old_filename}` in the root_dir
-fn drop_entries(filepaths: &[PathBuf]) {
+fn drop_entries(filepaths: &[PathBuf], root: &Path) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs();
 
-    for f in filepaths {
-        let name = format!("{now}_{f}", f = f.display());
-        let name = Path::new(ROOT_DIR).join(name);
-
-        if let Err(e) = fs::rename(f, &name) {
-            if e.kind() == io::ErrorKind::CrossesDevices {
-                //try copy
-                if let Err(e) = fs::copy(f, &name) {
-                    eprintln!("Failed kernel based file copy: {e}");
-                    break;
-                }
-            }
-            eprintln!("Failed rename: {e}");
+    for filepath in filepaths {
+        if !filepath.exists() {
+            eprintln!("File not found: {}", filepath.display());
+            continue;
         }
 
-        if f.is_dir() {
-            let _ = fs::remove_dir_all(f);
+        let abs_path = filepath
+            .canonicalize()
+            .unwrap_or_else(|_| filepath.to_path_buf());
+        let stored_name = format!("{now}_{}", abs_path.to_string_lossy());
+        let stored_path = root.join(stored_name);
+
+        if let Err(e) = fs::rename(filepath, &stored_path) {
+            if e.kind() == io::ErrorKind::CrossesDevices {
+                let copy_result = if filepath.is_dir() {
+                    copy_dir_all(filepath, &stored_path)
+                } else {
+                    fs::copy(filepath, &stored_path).map(|_| ())
+                };
+
+                if let Err(e) = copy_result {
+                    eprintln!("Failed to copy {}: {e}", filepath.display());
+                    continue;
+                }
+
+                let remove_result = if filepath.is_dir() {
+                    fs::remove_dir_all(filepath)
+                } else {
+                    fs::remove_file(filepath)
+                };
+
+                if let Err(e) = remove_result {
+                    eprintln!("Failed to remove original {}: {e}", filepath.display());
+                    let _ = fs::remove_file(&stored_path);
+                    continue;
+                }
+            } else {
+                eprintln!("Failed to drop {}: {e}", filepath.display());
+                continue;
+            }
+        }
+
+        println!("Dropped: {}", filepath.display());
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
         } else {
-            let _ = fs::remove_file(f);
+            fs::copy(&src_path, &dst_path)?;
         }
     }
+
+    Ok(())
 }

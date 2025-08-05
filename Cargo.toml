@@ -10,6 +10,10 @@ license = "MIT"
 # Keep this empty
 # Build that `is_number_even` crate you wanna fetch!
 
+[[bin]]
+name = "dr"
+path = "src/main.rs"
+
 [profile.release]
 strip = true
 opt-level = "s"
