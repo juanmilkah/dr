@@ -1,0 +1,17 @@
+[package]
+name = "dr"
+version = "0.0.1"
+edition = "2024"
+authors = ["Juan Milkah <juanmilkah@proton.me>"]
+repository = "https://github.com/juanmilkah/dr"
+license = "MIT"
+
+[dependencies]
+# Keep this empty
+# Build that `is_number_even` crate you wanna fetch!
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = "thin"
+panic = "abort"
